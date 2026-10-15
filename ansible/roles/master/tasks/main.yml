@@ -1,0 +1,103 @@
+---
+- name: Pull kubeadm images
+  ansible.builtin.command: kubeadm config images pull
+  changed_when: false
+
+- name: Initialize the control plane with kubeadm
+  ansible.builtin.command: >
+    kubeadm init
+    --apiserver-advertise-address={{ controlplane.ip }}
+    --apiserver-cert-extra-sans={{ controlplane.ip }}
+    --pod-network-cidr={{ master_pod_cidr }}
+    --service-cidr={{ master_service_cidr }}
+    --node-name {{ inventory_hostname }}
+    --ignore-preflight-errors Swap
+  args:
+    creates: /etc/kubernetes/admin.conf
+
+- name: Ensure local configs directory exists on controller
+  ansible.builtin.file:
+    path: "{{ playbook_dir }}/configs"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  become: false
+
+- name: Generate join command on control plane
+  ansible.builtin.shell: kubeadm token create --print-join-command
+  register: join_command_output
+  changed_when: false
+
+- name: Write join command to local configs/join.sh
+  ansible.builtin.copy:
+    content: "{{ join_command_output.stdout }}\n"
+    dest: "{{ playbook_dir }}/configs/join.sh"
+    mode: "0755"
+  delegate_to: localhost
+  become: false
+
+- name: Fetch admin.conf to local configs/config
+  ansible.builtin.fetch:
+    src: /etc/kubernetes/admin.conf
+    dest: "{{ playbook_dir }}/configs/config"
+    flat: true
+
+- name: Ensure root .kube dir exists
+  ansible.builtin.file:
+    path: /root/.kube
+    state: directory
+    mode: "0700"
+
+- name: Copy admin.conf to root kubeconfig
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /root/.kube/config
+    remote_src: true
+    mode: "0600"
+
+- name: Ensure vagrant .kube dir exists
+  ansible.builtin.file:
+    path: /home/vagrant/.kube
+    state: directory
+    owner: vagrant
+    group: vagrant
+    mode: "0755"
+
+- name: Copy kubeconfig to vagrant user
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf   
+    dest: /home/vagrant/.kube/config
+    remote_src: true
+    owner: vagrant
+    group: vagrant
+    mode: "0644"
+
+- name: Download Calico manifest
+  ansible.builtin.get_url:
+    url: "{{ master_calico_manifest_url }}"
+    dest: /tmp/calico.yaml
+    mode: "0644"
+
+- name: Apply Calico manifest
+  ansible.builtin.command: kubectl apply -f /tmp/calico.yaml
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: false
+
+- name: Apply metrics-server manifest
+  ansible.builtin.command: >
+    kubectl apply -f {{ master_metrics_server_manifest_url }}
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: false
+
+- name: Patch metrics-server for insecure TLS
+  ansible.builtin.command: >
+    kubectl patch deployment metrics-server -n kube-system
+    --type=json
+    -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: false
+
+

@@ -1,0 +1,48 @@
+---
+# ── Namespaces ─────────────────────────────────────────────────
+jenkins_namespace: jenkins
+app_namespace:     app-registre
+
+# ── Jenkins Helm ───────────────────────────────────────────────
+jenkins_chart:     "jenkins/jenkins"
+jenkins_release:   "jenkins"
+jenkins_storage_class: nfs-client
+jenkins_storage_size:  10Gi
+jenkins_node_port: 30080
+jenkins_pvc_wait_timeout:  10m
+jenkins_rollout_timeout:   20m
+jenkins_precheck_retries:  30
+jenkins_precheck_delay:    10
+jenkins_precheck_timeout:  10m
+jenkins_nfs_namespace:     nfs-provisioner
+jenkins_nfs_deployment:    nfs-subdir-external-provisioner
+
+# ── Probes ─────────────────────────────────────────────────────
+jenkins_health_probes_enabled:            true
+jenkins_startup_probe_failure_threshold:  360
+jenkins_startup_probe_timeout:            10
+jenkins_startup_probe_period:             15
+jenkins_readiness_probe_initial_delay:    120
+jenkins_liveness_probe_initial_delay:     300
+
+# ── Ressources Jenkins controller ──────────────────────────────
+jenkins_memory_request: 512Mi
+jenkins_memory_limit:   1500Mi
+jenkins_cpu_request:    50m
+jenkins_cpu_limit:      "1"
+
+# ── Ressources init container ──────────────────────────────────
+jenkins_init_memory_request: 512Mi
+jenkins_init_memory_limit:   1024Mi
+
+# ── MySQL ──────────────────────────────────────────────────────
+mysql_image:    "mysql:8.0"
+mysql_pvc_size: "5Gi"
+mysql_database: "registre_db"
+
+# ── Application ────────────────────────────────────────────────
+backend_image:    "{{ nexus_hostname }}:{{ nexus_docker_port }}/k8s-cluster/backend:latest"
+frontend_image:   "{{ nexus_hostname }}:{{ nexus_docker_port }}/k8s-cluster/frontend:latest"
+backend_replicas:  2
+frontend_replicas: 2
+app_node_port:    30090

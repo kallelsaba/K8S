@@ -1,0 +1,5 @@
+.vagrant/
+*.retry
+ansible/configs/config
+ansible/configs/join.sh
+ansible/group_vars/all/vault.yml

@@ -1,0 +1,6 @@
+---
+- name: Install Helm if not present
+  ansible.builtin.shell: |
+    curl -fsSL {{ master_helm_install_script_url }} | bash
+  args:
+    creates: "{{ master_helm_binary_path }}"

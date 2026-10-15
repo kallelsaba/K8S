@@ -1,0 +1,60 @@
+---
+# ==============================================================
+# Playbook maître — K8s-Cluster
+# ==============================================================
+
+- name: Prepare service node (Docker, NFS, Nexus, Gitea + bootstrap)
+  hosts: service
+  become: true
+  gather_facts: true
+  tags: [service]
+  roles:
+    - tools
+
+- name: Common setup on all Kubernetes nodes
+  hosts: k8s
+  become: true
+  gather_facts: true
+  tags: [common, k8s]
+  roles:
+    - common
+
+- name: Bootstrap control plane
+  hosts: master
+  become: true
+  gather_facts: true
+  tags: [master, k8s]
+  roles:
+    - master
+
+- name: Join worker nodes
+  hosts: worker
+  become: true
+  gather_facts: true
+  tags: [worker, k8s]
+  roles:
+    - worker
+
+- name: Install Helm
+  hosts: master
+  become: true
+  gather_facts: false
+  tags: [helm, k8s]
+  roles:
+    - helm
+
+- name: Deploy NFS provisioner
+  hosts: master
+  become: true
+  gather_facts: false
+  tags: [nfs]
+  roles:
+    - nfs
+
+- name: Deploy Jenkins + MySQL + App + CI/CD
+  hosts: master
+  become: true
+  gather_facts: false
+  tags: [jenkins]
+  roles:
+    - jenkins

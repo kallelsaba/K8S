@@ -1,0 +1,62 @@
+---
+cluster_name: K8s-Cluster
+
+# ── Réseau ────────────────────────────────────────────────────────────────────
+network:
+  service_ip:  "192.168.56.10"
+  control_ip:  "192.168.56.11"
+  worker1_ip:  "192.168.56.12"
+  dns_servers:
+    - 8.8.8.8
+    - 1.1.1.1
+
+# ── Ressources des VMs ────────────────────────────────────────────────────────
+nodes:
+  service:
+    cpu:    2
+    memory: 2048
+  control:
+    cpu:    2
+    memory: 4096
+  worker:
+    cpu:    2
+    memory: 3072
+
+# ── Box Vagrant ───────────────────────────────────────────────────────────────
+software:
+  box:        ubuntu/jammy64
+  kubernetes: 1.31.0-*
+
+# ── Nœud control-plane ────────────────────────────────────────────────────────
+controlplane:
+  name: control-plane
+  ip:   "192.168.56.11"
+
+# ── Workers (un seul) ─────────────────────────────────────────────────────────
+workers:
+  - name: worker-1
+    ip:   "192.168.56.12"
+
+# ── Services (vm-service) ─────────────────────────────────────────────────────
+services:
+  tools:
+    name: vm-service
+    ip:   "192.168.56.10"
+
+# ── Nexus Docker Registry ─────────────────────────────────────────────────────
+nexus_hostname:    "192.168.56.10"
+nexus_ui_port:     "8081"
+nexus_docker_port: "5000"
+
+# ── Gitea ─────────────────────────────────────────────────────────────────────
+gitea_hostname:  "192.168.56.10"
+gitea_http_port: "3000"
+gitea_ssh_port:  "222"
+
+# ── Secrets (à ne pas committer en clair — utiliser ansible-vault) ───────────
+vault_gitea_admin_user:       "GITEA_ADMIN_HERE"
+vault_gitea_admin_password:   "PWD_GITEA_ADMIN_HERE"
+vault_nexus_admin_password:   "PWD_NEXUS_ADMIN_HERE"
+vault_jenkins_admin_password: "PWD_JENKINS_ADMIN_HERE"
+vault_mysql_root_password:    "PWD_MYSQL_ROOT_HERE"
+vault_mysql_app_password:     "PWD_MYSQL_APP_HERE"

@@ -1,0 +1,47 @@
+---
+tools_docker_packages:
+  - docker.io
+  - docker-compose
+  - curl
+  - wget
+  - gnupg
+  - ufw
+
+tools_docker_users:
+  - vagrant
+
+# Compose command (override to "docker compose" if plugin is installed)
+tools_docker_compose_cmd: docker-compose
+
+tools_open_tcp_ports:
+  - "8081"
+  - "5000"
+  - "2049"
+  - "3000"
+  - "222"
+
+tools_nfs_export_dir: /srv/nfs/k8s
+tools_nfs_export_networks:
+  - 192.168.56.0/24
+  - 172.16.0.0/12
+
+nexus_data_dir: /opt/nexus-data
+nexus_hostname: "{{ services.tools.ip }}"
+nexus_ui_port:  "8081"
+nexus_docker_port: "5000"
+
+gitea_install_dir: /opt/gitea
+gitea_data_dir:    /opt/gitea/data
+gitea_image:       gitea/gitea:1.22
+gitea_hostname:    "{{ services.tools.ip }}"
+gitea_http_port:   "3000"
+gitea_ssh_port:    "222"
+
+# Nexus bootstrap
+nexus_data_dir:    /opt/nexus-data
+nexus_repo_name:   "k8s-cluster"
+
+# Gitea bootstrap
+gitea_install_dir: /opt/gitea
+gitea_data_dir:    /opt/gitea/data
+gitea_image:       gitea/gitea:1.22

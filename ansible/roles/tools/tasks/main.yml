@@ -1,0 +1,453 @@
+---
+# =============================================================================
+# Docker and base tooling
+# =============================================================================
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+
+- name: Install Docker and utilities
+  ansible.builtin.apt:
+    name: "{{ tools_docker_packages }}"
+    state: present
+
+- name: Enable Docker service
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+
+- name: Ensure docker group exists
+  ansible.builtin.group:
+    name: docker
+    state: present
+
+- name: Add requested users to docker group
+  ansible.builtin.user:
+    name: "{{ item }}"
+    groups: docker
+    append: true
+  loop: "{{ tools_docker_users }}"
+
+- name: Configure Docker insecure registry for Nexus
+  ansible.builtin.copy:
+    dest: /etc/docker/daemon.json
+    mode: "0644"
+    content: |
+      {
+        "insecure-registries": ["{{ nexus_hostname }}:{{ nexus_docker_port }}", "{{ nexus_hostname }}"]
+      }
+  notify: Restart Docker
+
+- name: Flush handlers
+  ansible.builtin.meta: flush_handlers
+
+- name: Allow SSH
+  ansible.builtin.ufw:
+    rule: allow
+    name: OpenSSH
+
+- name: Allow service ports through UFW
+  ansible.builtin.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop: "{{ tools_open_tcp_ports }}"
+
+- name: Enable UFW
+  ansible.builtin.ufw:
+    state: enabled
+    policy: allow
+
+# =============================================================================
+# NFS server
+# =============================================================================
+- name: Install NFS server packages
+  ansible.builtin.apt:
+    name:
+      - nfs-kernel-server
+      - nfs-common
+    state: present
+    update_cache: true
+
+- name: Create NFS export directory
+  ansible.builtin.file:
+    path: "{{ tools_nfs_export_dir }}"
+    state: directory
+    owner: nobody
+    group: nogroup
+    mode: "0777"
+
+- name: Configure NFS exports
+  ansible.builtin.copy:
+    dest: /etc/exports
+    mode: "0644"
+    content: |
+      {% for cidr in tools_nfs_export_networks %}
+      {{ tools_nfs_export_dir }}    {{ cidr }}(rw,sync,no_subtree_check,no_root_squash)
+      {% endfor %}
+  notify: Reload NFS exports
+
+- name: Enable and start NFS server
+  ansible.builtin.systemd:
+    name: nfs-kernel-server
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Force export reload immediately
+  ansible.builtin.command: exportfs -ra
+  changed_when: false
+
+# =============================================================================
+# Nexus — installation
+# =============================================================================
+- name: Create Nexus data directory
+  ansible.builtin.file:
+    path: "{{ nexus_data_dir }}"
+    state: directory
+    owner: 200
+    group: 200
+    mode: "0755"
+
+- name: Check if Nexus container exists
+  ansible.builtin.command: docker ps -a --format '{{ '{{' }}.Names{{ '}}' }}'
+  register: docker_containers
+  changed_when: false
+
+- name: Run Nexus 3 container
+  ansible.builtin.command: >
+    docker run -d
+    --name nexus
+    -p {{ nexus_ui_port }}:8081
+    -p {{ nexus_docker_port }}:5000
+    -v {{ nexus_data_dir }}:/nexus-data
+    --restart unless-stopped
+    sonatype/nexus3
+  when: "'nexus' not in docker_containers.stdout"
+
+- name: Wait for Nexus API to be ready
+  ansible.builtin.uri:
+    url: "http://{{ nexus_hostname }}:{{ nexus_ui_port }}/service/rest/v1/status"
+    status_code: 200
+  register: nexus_api_status
+  retries: 40
+  delay: 15
+  until: nexus_api_status.status is defined and nexus_api_status.status == 200
+
+# =============================================================================
+# Nexus — bootstrap (password + EULA + repo Docker)
+# =============================================================================
+- name: Vérifier si le password admin par défaut existe encore
+  ansible.builtin.stat:
+    path: "{{ nexus_data_dir }}/admin.password"
+  register: nexus_default_pwd_file
+
+- name: Lire le password admin par défaut
+  ansible.builtin.slurp:
+    src: "{{ nexus_data_dir }}/admin.password"
+  register: nexus_default_pwd
+  when: nexus_default_pwd_file.stat.exists
+
+- name: Définir le password admin courant
+  ansible.builtin.set_fact:
+    nexus_current_pwd: >-
+      {{ (nexus_default_pwd.content | b64decode | trim)
+         if nexus_default_pwd_file.stat.exists
+         else vault_nexus_admin_password }}
+
+- name: Changer le password admin Nexus
+  ansible.builtin.uri:
+    url: "http://localhost:{{ nexus_ui_port }}/service/rest/v1/security/users/admin/change-password"
+    method: PUT
+    user: admin
+    password: "{{ nexus_current_pwd }}"
+    force_basic_auth: true
+    headers:
+      Content-Type: text/plain
+    body: "{{ vault_nexus_admin_password }}"
+    status_code: [204, 400, 401]
+  when: nexus_default_pwd_file.stat.exists
+
+- name: Supprimer admin.password
+  ansible.builtin.file:
+    path: "{{ nexus_data_dir }}/admin.password"
+    state: absent
+  when: nexus_default_pwd_file.stat.exists
+
+- name: Récupérer le disclaimer EULA Nexus
+  ansible.builtin.uri:
+    url: "http://localhost:{{ nexus_ui_port }}/service/rest/v1/system/eula"
+    method: GET
+    user: admin
+    password: "{{ vault_nexus_admin_password }}"
+    force_basic_auth: true
+    return_content: true
+  register: nexus_eula
+  failed_when: false
+
+- name: Accepter l'EULA Nexus
+  ansible.builtin.uri:
+    url: "http://localhost:{{ nexus_ui_port }}/service/rest/v1/system/eula"
+    method: POST
+    user: admin
+    password: "{{ vault_nexus_admin_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      accepted: true
+      disclaimer: "{{ nexus_eula.json.disclaimer }}"
+    status_code: [204, 200]
+  when:
+    - nexus_eula.status == 200
+    - not nexus_eula.json.accepted
+
+- name: Créer le repo Docker hosted dans Nexus
+  ansible.builtin.uri:
+    url: "http://localhost:{{ nexus_ui_port }}/service/rest/v1/repositories/docker/hosted"
+    method: POST
+    user: admin
+    password: "{{ vault_nexus_admin_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      name: "{{ nexus_repo_name }}"
+      online: true
+      storage:
+        blobStoreName: "default"
+        strictContentTypeValidation: true
+        writePolicy: "ALLOW"
+      docker:
+        v1Enabled: false
+        forceBasicAuth: true
+        httpPort: "{{ nexus_docker_port | int }}"
+    status_code: [201, 400]
+
+- name: Activer le realm Docker Bearer Token
+  ansible.builtin.uri:
+    url: "http://localhost:{{ nexus_ui_port }}/service/rest/v1/security/realms/active"
+    method: PUT
+    user: admin
+    password: "{{ vault_nexus_admin_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      - "NexusAuthenticatingRealm"
+      - "DockerToken"
+    status_code: [204]
+
+- name: Attendre que le port Docker registry soit prêt
+  ansible.builtin.wait_for:
+    port: "{{ nexus_docker_port | int }}"
+    host: 127.0.0.1
+    timeout: 60
+
+# =============================================================================
+# Gitea — installation
+# =============================================================================
+- name: Create Gitea directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ gitea_install_dir }}"
+    - "{{ gitea_data_dir }}"
+
+- name: Create docker-compose for Gitea
+  ansible.builtin.copy:
+    dest: "{{ gitea_install_dir }}/docker-compose.yml"
+    mode: "0644"
+    content: |
+      version: "3"
+      services:
+        gitea:
+          image: {{ gitea_image }}
+          container_name: gitea
+          restart: always
+          environment:
+            - USER_UID=1000
+            - USER_GID=1000
+          volumes:
+            - {{ gitea_data_dir }}:/data
+          ports:
+            - "{{ gitea_http_port }}:3000"
+            - "{{ gitea_ssh_port }}:22"
+
+- name: Start Gitea container
+  ansible.builtin.command: "{{ tools_docker_compose_cmd }} up -d"
+  args:
+    chdir: "{{ gitea_install_dir }}"
+  changed_when: false
+
+- name: Configurer le webhook Gitea (ALLOWED_HOST_LIST)
+  ansible.builtin.blockinfile:
+    path: "{{ gitea_data_dir }}/gitea/conf/app.ini"
+    marker: "# {mark} ANSIBLE MANAGED — webhook"
+    block: |
+      [webhook]
+      ALLOWED_HOST_LIST = 192.168.56.0/24
+    create: false
+  notify: Restart Gitea
+
+- name: Wait for Gitea web UI
+  ansible.builtin.uri:
+    url: "http://{{ gitea_hostname }}:{{ gitea_http_port }}"
+    status_code: 200
+  register: gitea_status
+  retries: 15
+  delay: 10
+  until: gitea_status.status == 200
+
+- name: Create Gitea systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/gitea.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Gitea
+      After=docker.service network-online.target
+      Requires=docker.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      WorkingDirectory={{ gitea_install_dir }}
+      ExecStart={{ tools_docker_compose_cmd }} up -d
+      ExecStop={{ tools_docker_compose_cmd }} down
+      TimeoutStartSec=120
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable Gitea service
+  ansible.builtin.systemd:
+    name: gitea
+    enabled: true
+    daemon_reload: true
+
+# =============================================================================
+# Gitea — bootstrap (wizard + admin + repo app + push code)
+# =============================================================================
+- name: Vérifier si l'API Gitea est accessible
+  ansible.builtin.uri:
+    url: "http://{{ gitea_hostname }}:{{ gitea_http_port }}/api/v1/version"
+    status_code: [200, 404]
+  register: gitea_api_check
+  changed_when: false
+
+- name: Initialiser Gitea via le wizard
+  ansible.builtin.uri:
+    url: "http://{{ gitea_hostname }}:{{ gitea_http_port }}/"
+    method: POST
+    status_code: [200, 302]
+    follow_redirects: all
+    headers:
+      Content-Type: "application/x-www-form-urlencoded"
+    body: >-
+      db_type=sqlite3
+      &db_path=/data/gitea/gitea.db
+      &app_name=Gitea
+      &repo_root_path=/data/git/repositories
+      &run_user=git
+      &domain={{ gitea_hostname }}
+      &ssh_port=22
+      &http_port={{ gitea_http_port }}
+      &app_url=http://{{ gitea_hostname }}:{{ gitea_http_port }}/
+      &log_root_path=/data/gitea/log
+      &admin_name={{ vault_gitea_admin_user }}
+      &admin_passwd={{ vault_gitea_admin_password }}
+      &admin_confirm_passwd={{ vault_gitea_admin_password }}
+      &admin_email=admin@k8s-cluster.local
+  when: gitea_api_check.status == 404
+  changed_when: true
+
+- name: Attendre que l'API Gitea soit opérationnelle
+  ansible.builtin.uri:
+    url: "http://{{ gitea_hostname }}:{{ gitea_http_port }}/api/v1/version"
+    status_code: 200
+  register: gitea_api_ready
+  retries: 15
+  delay: 5
+  until: gitea_api_ready.status == 200
+
+- name: Créer l'utilisateur admin Gitea
+  ansible.builtin.command: >
+    docker exec --user git gitea
+    gitea admin user create
+    --admin
+    --username {{ vault_gitea_admin_user }}
+    --password {{ vault_gitea_admin_password }}
+    --email admin@k8s-cluster.local
+    --must-change-password=false
+  register: gitea_admin_create
+  failed_when:
+    - gitea_admin_create.rc != 0
+    - "'user already exists' not in gitea_admin_create.stderr"
+    - "'already exists' not in gitea_admin_create.stderr"
+  changed_when: gitea_admin_create.rc == 0
+
+- name: Créer le repo "app" dans Gitea
+  ansible.builtin.uri:
+    url: "http://{{ gitea_hostname }}:{{ gitea_http_port }}/api/v1/user/repos"
+    method: POST
+    user: "{{ vault_gitea_admin_user }}"
+    password: "{{ vault_gitea_admin_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      name: "app"
+      description: "Application Registre — K8s-Cluster CI/CD"
+      private: false
+      auto_init: true
+      default_branch: "main"
+    status_code: [201, 409]
+
+- name: Installer git sur vm-service
+  ansible.builtin.apt:
+    name: git
+    state: present
+
+- name: Cloner le repo Gitea
+  ansible.builtin.git:
+    repo: "http://{{ vault_gitea_admin_user }}:{{ vault_gitea_admin_password }}@{{ gitea_hostname }}:{{ gitea_http_port }}/{{ vault_gitea_admin_user }}/app.git"
+    dest: /tmp/app-repo
+    version: main
+    force: true
+
+- name: Copier le code applicatif dans le clone
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../app/"
+    dest: /tmp/app-repo/
+    mode: preserve
+
+- name: Configurer l'identité git
+  ansible.builtin.shell: |
+    git config user.email "admin@k8s-cluster.local"
+    git config user.name "{{ vault_gitea_admin_user }}"
+  args:
+    chdir: /tmp/app-repo
+
+- name: Vérifier s'il y a des changements à committer
+  ansible.builtin.command: git status --porcelain
+  args:
+    chdir: /tmp/app-repo
+  register: git_status
+  changed_when: false
+
+- name: Committer et pousser le code
+  ansible.builtin.shell: |
+    git add -A
+    git commit -m "Initial app deployment — K8s-Cluster"
+    git push origin main
+  args:
+    chdir: /tmp/app-repo
+  when: git_status.stdout != ""
+  changed_when: true
+
+- name: Résumé vm-service
+  ansible.builtin.debug:
+    msg: |
+      ✅ vm-service prête !
+      Nexus : http://{{ nexus_hostname }}:{{ nexus_ui_port }}
+      Gitea : http://{{ gitea_hostname }}:{{ gitea_http_port }}

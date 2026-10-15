@@ -1,0 +1,12 @@
+---
+master_pod_cidr: 172.16.0.0/16
+master_service_cidr: 172.17.0.0/18
+
+master_calico_version: 3.29.3
+master_calico_manifest_url: "https://raw.githubusercontent.com/projectcalico/calico/v{{ master_calico_version }}/manifests/calico.yaml"
+
+master_metrics_server_manifest_url: https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+master_helm_install_script_url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+
+

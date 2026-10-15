@@ -1,0 +1,14 @@
+---
+- name: Reload NFS exports
+  ansible.builtin.command: exportfs -ra
+  changed_when: false
+
+- name: Restart Docker
+  ansible.builtin.systemd:
+    name: docker
+    state: restarted
+
+- name: Restart Gitea
+  ansible.builtin.command: "{{ tools_docker_compose_cmd }} restart gitea"
+  args:
+    chdir: "{{ gitea_install_dir }}"

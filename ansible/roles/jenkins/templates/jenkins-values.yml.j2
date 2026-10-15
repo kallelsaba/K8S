@@ -1,0 +1,198 @@
+# ==============================================================
+# jenkins-values.yml.j2 — Helm values pour jenkins/jenkins
+# Adapté pour K8s-Cluster :
+#   - StorageClass nfs-client
+#   - NodePort 30080 sur worker-1 (192.168.56.12)
+#   - Nexus registry : 192.168.56.10:5000
+#   - Gitea : 192.168.56.10:3000
+#   - JCasC : credentials + serveur Gitea + job pipeline
+# ==============================================================
+
+controller:
+  image:
+    registry: docker.io
+    repository: jenkins/jenkins
+    tag: "lts-jdk21"
+
+  jenkinsUrl: "http://{{ network.worker1_ip }}:{{ jenkins_node_port }}/"
+
+  resources:
+    requests:
+      cpu:    "500m"
+      memory: "1Gi"
+    limits:
+      cpu:    "2000m"
+      memory: "{{ jenkins_memory_limit }}"
+
+  initContainerResources:
+    requests:
+      memory: "{{ jenkins_init_memory_request }}"
+    limits:
+      memory: "{{ jenkins_init_memory_limit }}"
+
+  initContainerEnv:
+    - name: JAVA_OPTS
+      value: "-Xmx512m"
+
+  probes:
+    startupProbe:
+      httpGet:
+        path: '/login'
+        port: 'http'
+      periodSeconds: {{ jenkins_startup_probe_period }}
+      timeoutSeconds: {{ jenkins_startup_probe_timeout }}
+      failureThreshold: {{ jenkins_startup_probe_failure_threshold }}
+    livenessProbe:
+      httpGet:
+        path: '/login'
+        port: 'http'
+      periodSeconds: 30
+      timeoutSeconds: 10
+      failureThreshold: 5
+      initialDelaySeconds: {{ jenkins_liveness_probe_initial_delay }}
+    readinessProbe:
+      httpGet:
+        path: '/login'
+        port: 'http'
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+      initialDelaySeconds: {{ jenkins_readiness_probe_initial_delay }}
+
+  admin:
+    username: "admin"
+    password: "{{ vault_jenkins_admin_password }}"
+
+  serviceType: NodePort
+  nodePort: {{ jenkins_node_port }}
+
+  serviceAccount:
+    create: true
+    name: jenkins
+  serviceAccountAgent:
+    create: true
+    name: jenkins-agent
+
+  additionalPlugins:
+    - gitea
+    - docker-workflow
+    - pipeline-stage-view
+    - ssh-agent
+    - kubernetes-cli
+    - job-dsl
+
+  persistence:
+    enabled: true
+    storageClass: "nfs-client"
+    size: "{{ jenkins_storage_size }}"
+    accessMode: ReadWriteMany
+
+  containerEnv:
+    - name: GITEA_USER
+      value: "{{ vault_gitea_admin_user }}"
+    - name: GITEA_PASS
+      value: "{{ vault_gitea_admin_password }}"
+    - name: NEXUS_USER
+      value: "admin"
+    - name: NEXUS_PASS
+      value: "{{ vault_nexus_admin_password }}"
+    - name: GITEA_URL
+      value: "http://{{ gitea_hostname }}:{{ gitea_http_port }}"
+    - name: NEXUS_REGISTRY
+      value: "{{ nexus_hostname }}:{{ nexus_docker_port }}"
+
+  additionalExistingSecrets:
+    - name: jenkins-ssh-key
+      keyName: privateKey
+
+  JCasC:
+    defaultConfig: true
+    configScripts:
+
+      welcome-message: |
+        jenkins:
+          systemMessage: "Jenkins K8s-Cluster — configuré via JCasC"
+
+      credentials: |
+        credentials:
+          system:
+            domainCredentials:
+              - credentials:
+                  - usernamePassword:
+                      scope: GLOBAL
+                      id: "gitea-credentials"
+                      username: "${GITEA_USER}"
+                      password: "${GITEA_PASS}"
+                      description: "Gitea admin"
+
+                  - usernamePassword:
+                      scope: GLOBAL
+                      id: "nexus-credentials"
+                      username: "${NEXUS_USER}"
+                      password: "${NEXUS_PASS}"
+                      description: "Nexus Docker registry"
+
+                  - basicSSHUserPrivateKey:
+                      scope: GLOBAL
+                      id: "control-plane-ssh"
+                      username: "vagrant"
+                      description: "SSH key vers control-plane"
+                      privateKeySource:
+                        directEntry:
+                          privateKey: "${jenkins-ssh-key-privateKey}"
+
+      gitea-server: |
+        unclassified:
+          giteaServers:
+            servers:
+              - displayName: "gitea-local"
+                serverUrl: "${GITEA_URL}"
+                manageHooks: true
+                credentialsId: "gitea-credentials"
+
+      global-env: |
+        jenkins:
+          globalNodeProperties:
+            - envVars:
+                env:
+                  - key: "NEXUS_REGISTRY"
+                    value: "${NEXUS_REGISTRY}"
+                  - key: "GITEA_URL"
+                    value: "${GITEA_URL}"
+
+      pipeline-job: |
+        jobs:
+          - script: >
+              pipelineJob('app-pipeline') {
+                definition {
+                  cpsScm {
+                    scm {
+                      git {
+                        remote {
+                          url('http://{{ gitea_hostname }}:{{ gitea_http_port }}/{{ vault_gitea_admin_user }}/app.git')
+                          credentials('gitea-credentials')
+                        }
+                        branch('*/main')
+                      }
+                    }
+                    scriptPath('Jenkinsfile')
+                  }
+                }
+              }
+
+agent:
+  enabled: true
+  podName: "jenkins-agent"
+  customJenkinsLabels:
+    - "k8s-agent"
+  resources:
+    requests:
+      cpu:    "200m"
+      memory: "256Mi"
+    limits:
+      cpu:    "1000m"
+      memory: "1Gi"
+
+rbac:
+  create: true
+  readSecrets: true

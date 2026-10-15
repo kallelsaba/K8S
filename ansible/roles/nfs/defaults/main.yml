@@ -1,0 +1,12 @@
+---
+master_nfs_provisioner_enabled:  true
+master_nfs_server:               "{{ services.tools.ip }}"
+master_nfs_path:                 /srv/nfs/k8s
+master_nfs_storage_class_name:   nfs-client
+master_nfs_storage_class_default: true
+master_nfs_reclaim_policy:       Retain
+master_nfs_helm_timeout:         10m
+master_nfs_wait_timeout:         5
+master_nfs_wait_retries:         30
+master_nfs_wait_delay:           2
+master_nfs_wait_connect_timeout: 3

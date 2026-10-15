@@ -1,0 +1,3 @@
+---
+worker_crio_pull_progress_timeout: 15m
+worker_kubelet_image_pull_progress_deadline: 15m

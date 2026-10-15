@@ -1,0 +1,86 @@
+---
+- name: Set system hostname to match inventory name
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+
+- name: Ensure /etc/hostname is correct
+  ansible.builtin.copy:
+    dest: /etc/hostname
+    content: "{{ inventory_hostname }}\n"
+    mode: "0644"
+
+- name: Update 127.0.1.1 entry in /etc/hosts to new hostname
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^127\.0\.1\.1\s+'
+    line: "127.0.1.1 {{ inventory_hostname }}"
+    state: present
+
+- name: Copy join script from controller to worker
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/configs/join.sh"
+    dest: /tmp/join.sh
+    mode: "0755"
+
+- name: Join the cluster with explicit --node-name
+  ansible.builtin.shell: /bin/bash /tmp/join.sh --node-name {{ inventory_hostname }}
+  args:
+    creates: /etc/kubernetes/kubelet.conf
+
+- name: Ensure vagrant .kube dir exists
+  ansible.builtin.file:
+    path: /home/vagrant/.kube
+    state: directory
+    owner: vagrant
+    group: vagrant
+    mode: "0755"
+
+- name: Copy kubeconfig to vagrant user
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/configs/config"
+    dest: /home/vagrant/.kube/config
+    owner: vagrant
+    group: vagrant
+    mode: "0644"
+
+- name: Label this node as worker
+  ansible.builtin.command: >
+    kubectl label node {{ inventory_hostname }} node-role.kubernetes.io/worker=worker --overwrite
+  delegate_to: "{{ groups['master'][0] }}"
+  become: true
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  register: label_result
+  retries: 30
+  delay: 5
+  until: label_result.rc == 0
+  changed_when: false
+
+- name: Create CRI-O override for large image timeouts
+  ansible.builtin.copy:
+    dest: /etc/crio/crio.conf.d/99-large-images.conf
+    mode: "0644"
+    content: |
+      [crio.image]
+      pull_progress_timeout = "{{ worker_crio_pull_progress_timeout }}"
+  notify: Restart CRI-O
+
+- name: Check if Kubelet config.yaml exists
+  ansible.builtin.stat:
+    path: /var/lib/kubelet/config.yaml
+  register: kubelet_conf
+
+- name: Increase Kubelet image pull progress deadline
+  ansible.builtin.lineinfile:
+    path: /var/lib/kubelet/config.yaml
+    regexp: '^imagePullProgressDeadline:'
+    line: "imagePullProgressDeadline: {{ worker_kubelet_image_pull_progress_deadline }}"
+    insertafter: EOF
+  when: kubelet_conf.stat.exists
+  register: kubelet_restart_needed
+
+- name: Restart Kubelet if config changed
+  ansible.builtin.systemd:
+    name: kubelet
+    state: restarted
+  when: kubelet_restart_needed.changed | default(false)

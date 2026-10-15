@@ -1,0 +1,46 @@
+---
+- name: Add NFS subdir provisioner Helm repo
+  ansible.builtin.command: >
+    helm repo add nfs-subdir-external-provisioner
+    https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: false
+  when: master_nfs_provisioner_enabled | bool
+
+- name: Update Helm repos
+  ansible.builtin.command: helm repo update
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: false
+  when: master_nfs_provisioner_enabled | bool
+
+- name: Wait for NFS server to be reachable
+  ansible.builtin.wait_for:
+    host: "{{ master_nfs_server }}"
+    port: 2049
+    connect_timeout: "{{ master_nfs_wait_connect_timeout }}"
+    timeout: "{{ master_nfs_wait_timeout }}"
+  register: nfs_wait
+  retries: "{{ master_nfs_wait_retries }}"
+  delay: "{{ master_nfs_wait_delay }}"
+  until: nfs_wait is succeeded
+  when: master_nfs_provisioner_enabled | bool
+
+- name: Deploy NFS subdir external provisioner
+  ansible.builtin.command: >
+    helm upgrade --install nfs-subdir-external-provisioner
+    nfs-subdir-external-provisioner/nfs-subdir-external-provisioner
+    --namespace nfs-provisioner
+    --create-namespace
+    --set nfs.server={{ master_nfs_server }}
+    --set nfs.path={{ master_nfs_path }}
+    --set storageClass.name={{ master_nfs_storage_class_name }}
+    --set storageClass.defaultClass={{ master_nfs_storage_class_default | lower }}
+    --set storageClass.reclaimPolicy={{ master_nfs_reclaim_policy }}
+    --atomic
+    --timeout {{ master_nfs_helm_timeout }}
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: false
+  when: master_nfs_provisioner_enabled | bool

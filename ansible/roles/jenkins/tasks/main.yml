@@ -1,0 +1,300 @@
+---
+# ==============================================================
+# ROLE jenkins — Jenkins + MySQL + App étudiants + CI/CD
+# ==============================================================
+
+# ── 1. Namespaces ──────────────────────────────────────────────
+- name: Créer le namespace Jenkins
+  ansible.builtin.command: kubectl create namespace {{ jenkins_namespace }}
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  register: ns_result
+  failed_when: ns_result.rc != 0 and 'already exists' not in ns_result.stderr
+  changed_when: "'already exists' not in ns_result.stderr"
+
+- name: Créer le namespace app-registre
+  ansible.builtin.command: kubectl create namespace {{ app_namespace }}
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  register: app_ns_result
+  failed_when: app_ns_result.rc != 0 and 'already exists' not in app_ns_result.stderr
+  changed_when: "'already exists' not in app_ns_result.stderr"
+
+# ── 2. Secret Docker Nexus ─────────────────────────────────────
+- name: Créer le secret Docker Nexus dans jenkins
+  ansible.builtin.command: >
+    kubectl create secret docker-registry nexus-registry
+    --docker-server={{ nexus_hostname }}:{{ nexus_docker_port }}
+    --docker-username=admin
+    --docker-password={{ vault_nexus_admin_password }}
+    -n {{ jenkins_namespace }}
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  failed_when: false
+  changed_when: false
+
+- name: Créer le secret Docker Nexus dans app-registre
+  ansible.builtin.command: >
+    kubectl create secret docker-registry nexus-registry
+    --docker-server={{ nexus_hostname }}:{{ nexus_docker_port }}
+    --docker-username=admin
+    --docker-password={{ vault_nexus_admin_password }}
+    -n {{ app_namespace }}
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  failed_when: false
+  changed_when: false
+
+# ── 3. Clé SSH Jenkins → control-plane ────────────────────────
+- name: Générer la clé SSH Jenkins
+  ansible.builtin.command: >
+    ssh-keygen -t ed25519 -C "jenkins@k8s-cluster"
+    -f /tmp/jenkins_key -N ""
+  args:
+    creates: /tmp/jenkins_key
+
+- name: Lire la clé privée Jenkins
+  ansible.builtin.slurp:
+    src: /tmp/jenkins_key
+  register: jenkins_private_key
+
+- name: Lire la clé publique Jenkins
+  ansible.builtin.slurp:
+    src: /tmp/jenkins_key.pub
+  register: jenkins_public_key
+
+- name: Autoriser la clé Jenkins sur le control-plane
+  ansible.builtin.authorized_key:
+    user: vagrant
+    key: "{{ jenkins_public_key['content'] | b64decode }}"
+    state: present
+
+- name: Créer le secret SSH Jenkins dans K8s
+  ansible.builtin.command: >
+    kubectl create secret generic jenkins-ssh-key
+    --from-literal=privateKey="{{ jenkins_private_key['content'] | b64decode }}"
+    -n {{ jenkins_namespace }}
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  failed_when: false
+  changed_when: false
+
+# ── 4. Helm Jenkins ────────────────────────────────────────────
+- name: Ajouter le dépôt Helm Jenkins
+  ansible.builtin.command: helm repo add jenkins https://charts.jenkins.io
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: false
+
+- name: Mettre à jour les dépôts Helm
+  ansible.builtin.command: helm repo update
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: false
+
+- name: Attendre que le NFS provisioner soit prêt
+  ansible.builtin.command: >
+    kubectl rollout status deployment/{{ jenkins_nfs_deployment }}
+    -n {{ jenkins_nfs_namespace }}
+    --timeout={{ jenkins_precheck_timeout }}
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  register: jenkins_nfs_rollout
+  retries: "{{ jenkins_precheck_retries }}"
+  delay: "{{ jenkins_precheck_delay }}"
+  until: jenkins_nfs_rollout.rc == 0
+  changed_when: false
+
+- name: Générer jenkins-values.yml
+  ansible.builtin.template:
+    src: jenkins-values.yml.j2
+    dest: /tmp/jenkins-values.yml
+    mode: "0644"
+
+- name: Déployer Jenkins via Helm
+  ansible.builtin.command: >
+    helm upgrade --install jenkins jenkins/jenkins
+    --namespace {{ jenkins_namespace }}
+    --values /tmp/jenkins-values.yml
+    --timeout 20m
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: false
+
+- name: Vérifier le statut du PVC Jenkins
+  ansible.builtin.command: >
+    kubectl get pvc jenkins -n {{ jenkins_namespace }}
+    -o jsonpath='{.status.phase}'
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  register: jenkins_pvc_phase
+  changed_when: false
+  retries: 20
+  delay: 15
+  until: jenkins_pvc_phase.stdout == "Bound"
+
+- name: Échouer si le PVC Jenkins n'est pas Bound
+  ansible.builtin.fail:
+    msg: "Jenkins PVC non Bound (status={{ jenkins_pvc_phase.stdout }}). NFS provisioner HS ?"
+  when: jenkins_pvc_phase.stdout != "Bound"
+
+- name: Attendre que Jenkins soit Running
+  block:
+    - name: Attendre le rollout Jenkins
+      ansible.builtin.command: >
+        kubectl rollout status statefulset/jenkins
+        -n {{ jenkins_namespace }}
+        --timeout={{ jenkins_rollout_timeout }}
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      changed_when: false
+  rescue:
+    - name: Collecter les pods Jenkins
+      ansible.builtin.command: kubectl get pods -n {{ jenkins_namespace }} -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: jenkins_pod_status
+      changed_when: false
+      failed_when: false
+    - name: Collecter les events Jenkins
+      ansible.builtin.command: kubectl get events -n {{ jenkins_namespace }} --sort-by=.lastTimestamp
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: jenkins_events
+      changed_when: false
+      failed_when: false
+    - name: Afficher les diagnostics Jenkins
+      ansible.builtin.debug:
+        msg: |
+          Jenkins rollout timeout.
+          Pods: {{ jenkins_pod_status.stdout }}
+          Events: {{ jenkins_events.stdout }}
+    - name: Échouer avec diagnostics
+      ansible.builtin.fail:
+        msg: "Jenkins rollout timeout. Voir diagnostics ci-dessus."
+
+# ── 5. Secret MySQL ────────────────────────────────────────────
+- name: Créer le secret MySQL
+  ansible.builtin.command: >
+    kubectl create secret generic mysql-secret
+    --from-literal=root-password={{ vault_mysql_root_password }}
+    --from-literal=app-password={{ vault_mysql_app_password }}
+    -n {{ app_namespace }}
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  failed_when: false
+  changed_when: false
+
+# ── 6. Déployer MySQL ──────────────────────────────────────────
+- name: Générer le manifest MySQL
+  ansible.builtin.template:
+    src: mysql.yml.j2
+    dest: /tmp/mysql.yml
+    mode: "0644"
+
+- name: Appliquer MySQL
+  ansible.builtin.command: kubectl apply -f /tmp/mysql.yml
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: false
+
+- name: Attendre que MySQL soit prêt
+  ansible.builtin.command: >
+    kubectl rollout status statefulset/mysql
+    -n {{ app_namespace }} --timeout=300s
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: false
+
+# ── 7. Build et push des images ────────────────────────────────
+- name: Copier le code app sur vm-service
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../app/"
+    dest: /opt/app/
+    mode: preserve
+  delegate_to: "{{ groups['service'][0] }}"
+
+- name: Builder et pousser l'image backend
+  ansible.builtin.shell: |
+    docker login {{ nexus_hostname }}:{{ nexus_docker_port }} \
+      -u admin -p {{ vault_nexus_admin_password }}
+    docker build -t {{ backend_image }} /opt/app/backend/
+    docker push {{ backend_image }}
+  delegate_to: "{{ groups['service'][0] }}"
+  changed_when: false
+
+- name: Builder et pousser l'image frontend
+  ansible.builtin.shell: |
+    docker login {{ nexus_hostname }}:{{ nexus_docker_port }} \
+      -u admin -p {{ vault_nexus_admin_password }}
+    docker build -t {{ frontend_image }} /opt/app/frontend/
+    docker push {{ frontend_image }}
+  delegate_to: "{{ groups['service'][0] }}"
+  changed_when: false
+
+# ── 8. Déployer Backend + Frontend ────────────────────────────
+- name: Générer les manifests de l'application
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "/tmp/{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - { src: backend.yml.j2,  dest: backend.yml }
+    - { src: frontend.yml.j2, dest: frontend.yml }
+    - { src: mysql.yml.j2,    dest: mysql.yml }
+
+- name: Appliquer Backend
+  ansible.builtin.command: kubectl apply -f /tmp/backend.yml
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: false
+
+- name: Appliquer Frontend
+  ansible.builtin.command: kubectl apply -f /tmp/frontend.yml
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  changed_when: false
+
+# ── 9. Webhook Gitea → Jenkins ────────────────────────────────
+- name: Attendre que Jenkins soit accessible via HTTP
+  ansible.builtin.uri:
+    url: "http://{{ network.worker1_ip }}:{{ jenkins_node_port }}/login"
+    status_code: 200
+  register: jenkins_up
+  retries: 20
+  delay: 15
+  until: jenkins_up.status == 200
+
+- name: Créer le webhook Gitea → Jenkins
+  ansible.builtin.uri:
+    url: "http://{{ gitea_hostname }}:{{ gitea_http_port }}/api/v1/repos/{{ vault_gitea_admin_user }}/app/hooks"
+    method: POST
+    user: "{{ vault_gitea_admin_user }}"
+    password: "{{ vault_gitea_admin_password }}"
+    force_basic_auth: true
+    status_code: [201, 422]
+    body_format: json
+    body:
+      type: "gitea"
+      active: true
+      config:
+        url: "http://{{ network.worker1_ip }}:{{ jenkins_node_port }}/gitea-webhook/post"
+        content_type: "json"
+      events: ["push"]
+  changed_when: false
+
+- name: Créer le RBAC Jenkins deployer
+  kubernetes.core.k8s:
+    state: present
+    src: "{{ role_path }}/files/jenkins-rbac.yml"
+
+# ── 10. Résumé ─────────────────────────────────────────────────
+- name: Résumé du déploiement
+  ansible.builtin.debug:
+    msg: |
+      ✅ Déploiement complet !
+      Jenkins      : http://{{ network.worker1_ip }}:{{ jenkins_node_port }}
+      App étudiants: http://{{ network.worker1_ip }}:{{ app_node_port }}
+      Gitea        : http://{{ gitea_hostname }}:{{ gitea_http_port }}
+      Nexus        : http://{{ nexus_hostname }}:{{ nexus_ui_port }}
+      Pipeline     : app-pipeline (déclenché par push sur Gitea)
